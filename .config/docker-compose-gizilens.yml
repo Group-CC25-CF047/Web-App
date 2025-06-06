@@ -1,0 +1,47 @@
+services:
+    postgres:
+        image: postgres:17
+        container_name: postgres-prod
+        restart: always
+        ports:
+            - "127.0.0.1:5432:5432"
+        environment:
+            - POSTGRES_USER=${POSTGRES_USER_PROD}
+            - POSTGRES_PASSWORD=${POSTGRES_PASSWORD_PROD}
+            - POSTGRES_DB=${POSTGRES_DB_PROD}
+        volumes:
+            - ./postgres/data:/var/lib/postgresql/data
+            - ./postgres/migrations:/docker-entrypoint-initdb.d
+        networks:
+            - gizilens_network
+
+    redis:
+        image: redis:8.0-M04-alpine
+        container_name: redis-prod
+        restart: always
+        ports:
+            - "127.0.0.1:6379:6379"
+        command: redis-server --requirepass ${REDIS_PASSWORD_PROD}
+        networks:
+            - gizilens_network
+
+    nginx:
+        image: nginx:stable-perl
+        container_name: nginx-prod
+        restart: always
+        ports:
+            - "443:443"
+            - "80:80"
+        volumes:
+            - ./nginx/conf.d:/etc/nginx/conf.d
+            - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
+            - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro
+            - /var/www/html:/var/www/html:ro
+        networks:
+            - gizilens_network
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
+
+networks:
+    gizilens_network:
+        external: true
