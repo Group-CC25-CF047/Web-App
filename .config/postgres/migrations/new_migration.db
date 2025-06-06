@@ -1,0 +1,707 @@
+-- File: 01-create-updates-trigger.sql
+-- 01-create-updates-trigger.sql
+
+/*
+ * Automatic Timestamp Update Function
+ *
+ * This script creates a trigger function that automatically updates timestamps
+ * for tables with an updated_at column.
+ */
+
+/*
+ * Function: update_column_updated_at
+ *
+ * Description:
+ *   This function automatically updates the `updated_at` column of a table
+ *   to the current timestamp whenever a row in that table is updated.
+ *
+ * SQL Explanation:
+ *   - Creates a PL/pgSQL function that returns TRIGGER
+ *   - Sets the NEW.updated_at value to now() (current timestamp)
+ *   - Returns NEW to allow the update operation to proceed with the updated timestamp
+ *   - Designed to be used with BEFORE UPDATE triggers
+ *
+ * Return Type: TRIGGER
+ *
+ * Usage:
+ *   This function should be associated with a BEFORE UPDATE trigger on any
+ *   table that has an `updated_at` column of type TIMESTAMP WITH TIME ZONE.
+ *
+ * Example Trigger Creation:
+ *   CREATE TRIGGER update_mytable_updated_at
+ *   BEFORE UPDATE ON mytable
+ *   FOR EACH ROW
+ *   EXECUTE FUNCTION update_column_updated_at();
+ */
+
+CREATE OR REPLACE FUNCTION update_column_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- File: 02-create-users-table.sql
+-- 02-create-users-table.sql
+
+/* 
+ * Users Table and Associated Objects
+ *
+ * This script creates the `users` table, along with associated indexes,
+ * a custom ENUM type, trigger, and functions for soft deletion.
+ */
+
+/* 
+ * Custom ENUM Type: user_role
+ *
+ * Description:
+ *   Defines the possible roles a user can have within the system.
+ *
+ * SQL Explanation:
+ *   - Creates a custom ENUM type that restricts possible values to a predefined set
+ *   - Provides type safety by ensuring only valid role values can be assigned
+ *   - More efficient than using VARCHAR with CHECK constraints
+ *
+ * Values:
+ *   - client:    Standard client with basic privileges.
+ *   - admin:     Administrator with full access.
+ *   - moderator: Moderator with elevated privileges, but less than admin.
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_role') THEN
+        CREATE TYPE user_role AS ENUM ('client', 'admin', 'moderator');
+    END IF;
+END $$;
+
+/*
+ * Table: users
+ *
+ * Description:
+ *   Stores information about users in the system.  Implements soft deletes
+ *   using the `is_deleted` column.
+ *
+ * SQL Explanation:
+ *   - Creates a table with UUID PRIMARY KEY for better scalability and to avoid collisions
+ *   - Uses gen_random_uuid() function to automatically generate UUIDs for new users
+ *   - Includes timestamp fields for tracking record creation and modification
+ *   - Uses soft deletion pattern with is_deleted boolean flag
+ *
+ * Columns:
+ *   - id (UUID PRIMARY KEY DEFAULT gen_random_uuid()): Unique identifier for
+ *     each user. Uses UUIDs for better scalability and to avoid collisions.
+ *   - first_name (VARCHAR(255) NOT NULL): The user's first name.
+ *   - last_name (VARCHAR(255) DEFAULT ' '): The user's last name (optional).
+ *   - password (VARCHAR(255) NOT NULL): The user's *hashed* password.  Never
+ *     store passwords in plain text.
+ *   - email (VARCHAR(255) UNIQUE NOT NULL): The user's email address (unique).
+ *   - role (user_role NOT NULL): The user's role (see user_role ENUM).
+ *   - photo (TEXT): URL or path to the user's photo (optional).
+ *   - created_at (TIMESTAMP WITH TIME ZONE DEFAULT NOW()): Timestamp of when
+ *     the user record was created.
+ *   - updated_at (TIMESTAMP WITH TIME ZONE DEFAULT NOW()): Timestamp of the last update to
+ *     the user record.  Automatically updated by the
+ *     `update_users_updated_at` trigger.
+ *   - is_deleted (BOOLEAN NOT NULL DEFAULT FALSE): Flag indicating whether the
+ *     user has been soft-deleted.
+ *   - created_by (UUID): ID of the user who created this record.
+ *   - updated_by (UUID): ID of the user who last updated this record.
+ */
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name VARCHAR(255) NOT NULL,
+    last_name VARCHAR(255) DEFAULT ' ',
+    password VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    role user_role NOT NULL,
+    photo TEXT,
+    Description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_by UUID,
+    updated_by UUID
+);
+
+/* 
+ * Column Documentation
+ * 
+ * SQL Explanation:
+ *   - COMMENT statements add metadata to database objects
+ *   - This metadata is visible in database administration tools
+ *   - Comments do not affect database performance or functionality
+ */
+COMMENT ON COLUMN users.id IS 'Unique identifier for each user';
+COMMENT ON COLUMN users.first_name IS 'User''s first name';
+COMMENT ON COLUMN users.last_name IS 'User''s last name (optional)';
+COMMENT ON COLUMN users.password IS 'User''s hashed password - never store in plain text';
+COMMENT ON COLUMN users.email IS 'User''s email address - must be unique';
+COMMENT ON COLUMN users.role IS 'User''s role in the system (client, admin, or moderator)';
+COMMENT ON COLUMN users.photo IS 'URL or path to the user''s profile photo (optional)';
+COMMENT ON COLUMN users.created_at IS 'Timestamp when the user record was created';
+COMMENT ON COLUMN users.updated_at IS 'Timestamp of the last update to the user record';
+COMMENT ON COLUMN users.is_deleted IS 'Flag indicating whether the user has been soft-deleted';
+COMMENT ON COLUMN users.created_by IS 'ID of the user who created this record';
+COMMENT ON COLUMN users.updated_by IS 'ID of the user who last updated this record';
+
+/* 
+ * Validation Constraints
+ * 
+ * SQL Explanation:
+ *   - Adds additional CHECK constraints to ensure data integrity
+ *   - Each constraint creates a rule that must be satisfied for data to be accepted
+ *   - Enforces business rules at the database level rather than application level
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_first_name_not_whitespace') THEN
+        ALTER TABLE users ADD CONSTRAINT check_first_name_not_whitespace 
+          CHECK (TRIM(first_name) <> '');
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_password_minimum_length') THEN
+        ALTER TABLE users ADD CONSTRAINT check_password_minimum_length 
+          CHECK (LENGTH(password) >= 60); /* Appropriate for bcrypt hashes */
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_password_not_email') THEN
+        ALTER TABLE users ADD CONSTRAINT check_password_not_email 
+          CHECK (password <> email);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_email_format') THEN
+        ALTER TABLE users ADD CONSTRAINT check_email_format
+          CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$');
+    END IF;
+END $$;
+
+/*
+ * Indexes on the users table
+ *
+ * Description:
+ * These indexes improve query performance on frequently accessed columns.
+ * Uses B-tree indexes for all columns as it's the most compatible option
+ * - B-tree: For columns used in range queries, ordering, and equality conditions
+ * Conditional unique indexes ensure uniqueness for active users only.
+ *
+ * SQL Explanation:
+ *   - Creates indexes on columns commonly used in WHERE, JOIN, and ORDER BY clauses
+ *   - Creates a conditional unique index that only applies to non-deleted users
+ *   - Each CREATE INDEX statement builds a separate database structure that speeds up lookups
+ *   - Indexes require additional storage but significantly improve query speed
+ *
+ * Indexes:
+ *   - idx_users_email_unique: Unique B-tree index on email for non-deleted users.
+ *   - idx_users_first_name: B-tree index on first_name for partial text searches and sorting.
+ *   - idx_users_last_name: B-tree index on last_name for partial text searches and sorting.
+ *   - idx_users_role: B-tree index on role for role lookups.
+ *   - idx_users_created_at: B-tree index on created_at for timestamp range queries.
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_email_unique') THEN
+        CREATE UNIQUE INDEX idx_users_email_unique ON users (email) WHERE is_deleted = FALSE;
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_first_name') THEN
+        CREATE INDEX idx_users_first_name ON users (first_name);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_last_name') THEN
+        CREATE INDEX idx_users_last_name ON users (last_name);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_role') THEN
+        CREATE INDEX idx_users_role ON users (role);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_created_at') THEN
+        CREATE INDEX idx_users_created_at ON users (created_at);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_users_is_deleted') THEN
+        CREATE INDEX idx_users_is_deleted ON users (is_deleted);
+    END IF;
+END $$;
+
+/*
+ * Trigger: update_users_updated_at_update
+ *
+ * Description:
+ *   Automatically updates the `updated_at` column to the current timestamp
+ *   whenever a row in the `users` table is updated.
+ *
+ * SQL Explanation:
+ *   - BEFORE UPDATE trigger executes prior to the actual update operation
+ *   - FOR EACH ROW means it runs once for every row affected by the UPDATE
+ *   - Calls update_column_updated_at() function to set the current timestamp
+ *
+ *   - BEFORE UPDATE: The trigger fires before the update operation occurs.
+ *   - FOR EACH ROW: The trigger executes for each row affected by the update.
+ *   - EXECUTE FUNCTION update_column_updated_at(): Calls the
+ *     `update_column_updated_at` function (defined separately) to perform
+ *     the actual update of the `updated_at` column.
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_users_updated_at_update') THEN
+        CREATE TRIGGER update_users_updated_at_update
+        BEFORE UPDATE ON users
+        FOR EACH ROW
+        EXECUTE FUNCTION update_column_updated_at();
+    END IF;
+END $$;
+
+/*
+ * Trigger: update_users_updated_at_insert
+ *
+ * Description:
+ *   Automatically updates the `updated_at` column to the current timestamp
+ *   whenever a row is inserted into the `users` table.
+ *
+ * SQL Explanation:
+ *   - BEFORE INSERT trigger executes prior to the actual insert operation
+ *   - FOR EACH ROW means it runs once for every row affected by the INSERT
+ *   - Calls update_column_updated_at() function to set the current timestamp
+ *
+ *   - BEFORE INSERT: The trigger fires before the insert operation occurs.
+ *   - FOR EACH ROW: The trigger executes for each row being inserted.
+ *   - EXECUTE FUNCTION update_column_updated_at(): Calls the
+ *     `update_column_updated_at` function (defined separately) to perform
+ *     the actual update of the `updated_at` column.
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_users_updated_at_insert') THEN
+        CREATE TRIGGER update_users_updated_at_insert 
+        BEFORE INSERT ON users 
+        FOR EACH ROW
+        EXECUTE FUNCTION update_column_updated_at();
+    END IF;
+END $$;
+
+/* 
+ * User Audit Log Table
+ *
+ * Description:
+ *   Tracks changes to user data for compliance and security purposes.
+ *
+ * SQL Explanation:
+ *   - Creates a separate audit table with a foreign key to users(id)
+ *   - Uses JSONB data type for flexible storage of changed field data
+ *   - Includes timestamp and user tracking for complete audit trail
+ */
+CREATE TABLE IF NOT EXISTS user_audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    changed_fields JSONB,
+    changed_by UUID,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+/* Add foreign key with IF NOT EXISTS check */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'user_audit_log_user_id_fkey') THEN
+        ALTER TABLE user_audit_log 
+        ADD CONSTRAINT user_audit_log_user_id_fkey 
+        FOREIGN KEY (user_id) REFERENCES users(id);
+    END IF;
+END $$;
+
+/* 
+ * Audit Log Column Documentation
+ *
+ * SQL Explanation:
+ *   - COMMENT statements add metadata to database objects
+ *   - This metadata is visible in database administration tools
+ *   - Comments do not affect database performance or functionality
+ */
+COMMENT ON TABLE user_audit_log IS 'Audit log for tracking changes to user data';
+COMMENT ON COLUMN user_audit_log.id IS 'Unique identifier for the audit log entry';
+COMMENT ON COLUMN user_audit_log.user_id IS 'ID of the user whose data was changed';
+COMMENT ON COLUMN user_audit_log.action IS 'Type of action performed (create, update, delete, login, etc.)';
+COMMENT ON COLUMN user_audit_log.changed_fields IS 'JSON object containing the changed fields and their values';
+COMMENT ON COLUMN user_audit_log.changed_by IS 'ID of the user who made the change';
+COMMENT ON COLUMN user_audit_log.timestamp IS 'Timestamp when the change occurred';
+
+/* 
+ * Audit Log Indexes
+ *
+ * SQL Explanation:
+ *   - Creates B-tree indexes to speed up queries against the audit log
+ *   - Improves performance for filtering by user_id, timestamp, or action type
+ *   - Each index consumes storage space but optimizes query execution plans
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_user_audit_log_user_id') THEN
+        CREATE INDEX idx_user_audit_log_user_id ON user_audit_log(user_id);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_user_audit_log_timestamp') THEN
+        CREATE INDEX idx_user_audit_log_timestamp ON user_audit_log(timestamp);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_user_audit_log_action') THEN
+        CREATE INDEX idx_user_audit_log_action ON user_audit_log(action);
+    END IF;
+END $$;
+
+/*
+ * Function: log_user_change
+ *
+ * Description:
+ *   Records changes to user data in the audit log
+ *   Automatically captures user changes and stores them in the audit log
+ *   with proper attribution of who made the changes
+ *
+ * SQL Explanation:
+ *   - Creates a PL/pgSQL function that returns TRIGGER
+ *   - Uses TG_OP to detect operation type (INSERT, UPDATE, DELETE)
+ *   - Builds JSONB objects to store changed fields
+ *   - Retrieves current user ID from session settings
+ *   - Handles exceptions for missing user ID
+ *   - Inserts a new record in user_audit_log table
+ */
+CREATE OR REPLACE FUNCTION log_user_change()
+RETURNS TRIGGER AS $$
+DECLARE
+    changed_data JSONB;
+    action_type VARCHAR(50);
+    current_user_id UUID;
+BEGIN
+    BEGIN
+        current_user_id := NULLIF(current_setting('app.user_id', TRUE), '')::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        current_user_id := NULL;
+    END;
+
+    IF TG_OP = 'INSERT' THEN
+        action_type := 'create';
+        changed_data := to_jsonb(NEW);
+        changed_data := changed_data - 'password';
+        
+        IF current_user_id IS NULL THEN
+            current_user_id := NEW.id;
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        action_type := 'update';
+        changed_data := jsonb_build_object();
+        
+        IF OLD.first_name IS DISTINCT FROM NEW.first_name THEN
+            changed_data := changed_data || jsonb_build_object('first_name', NEW.first_name);
+        END IF;
+        
+        IF OLD.last_name IS DISTINCT FROM NEW.last_name THEN
+            changed_data := changed_data || jsonb_build_object('last_name', NEW.last_name);
+        END IF;
+        
+        IF OLD.email IS DISTINCT FROM NEW.email THEN
+            changed_data := changed_data || jsonb_build_object('email', NEW.email);
+        END IF;
+        
+        IF OLD.role IS DISTINCT FROM NEW.role THEN
+            changed_data := changed_data || jsonb_build_object('role', NEW.role);
+        END IF;
+        
+        IF OLD.is_deleted IS DISTINCT FROM NEW.is_deleted THEN
+            changed_data := changed_data || jsonb_build_object('is_deleted', NEW.is_deleted);
+        END IF;
+        
+        IF OLD.photo IS DISTINCT FROM NEW.photo THEN
+            changed_data := changed_data || jsonb_build_object('photo', NEW.photo);
+        END IF;
+        
+        IF OLD.password IS DISTINCT FROM NEW.password THEN
+            changed_data := changed_data || jsonb_build_object('password_changed', true);
+        END IF;
+        
+        IF current_user_id IS NULL THEN
+            current_user_id := NEW.id;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        action_type := 'delete';
+        changed_data := to_jsonb(OLD);
+        changed_data := changed_data - 'password';
+        
+        IF current_user_id IS NULL THEN
+            current_user_id := OLD.id;
+        END IF;
+    END IF;
+    
+    INSERT INTO user_audit_log (
+        user_id, 
+        action, 
+        changed_fields, 
+        changed_by
+    ) VALUES (
+        CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END,
+        action_type,
+        changed_data,
+        current_user_id 
+    );
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+/* 
+ * User Audit Trigger
+ *
+ * Description:
+ *   Activates the log_user_change function whenever users are modified
+ *
+ * SQL Explanation:
+ *   - AFTER trigger fires after the database operation completes
+ *   - Fires on INSERT, UPDATE, or DELETE operations
+ *   - Executes log_user_change() function for each affected row
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'user_audit_trigger') THEN
+        CREATE TRIGGER user_audit_trigger
+        AFTER INSERT OR UPDATE OR DELETE ON users
+        FOR EACH ROW EXECUTE FUNCTION log_user_change();
+    END IF;
+END $$;
+
+/*
+ * Function: set_user_timestamps
+ *
+ * Description:
+ *   Automatically tracks who created and modified user records
+ *
+ * SQL Explanation:
+ *   - Creates a BEFORE trigger function for INSERT and UPDATE operations
+ *   - Gets current user ID from session context
+ *   - Assigns appropriate user IDs to created_by and updated_by fields
+ *   - Uses NULLIF to handle cases where no user ID is set
+ */
+CREATE OR REPLACE FUNCTION set_user_timestamps()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.created_by := NULLIF(current_setting('app.user_id', TRUE), '')::UUID;
+    ELSIF TG_OP = 'UPDATE' THEN
+        NEW.updated_by := NULLIF(current_setting('app.user_id', TRUE), '')::UUID;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+/* 
+ * User Tracking Trigger
+ *
+ * Description:
+ *   Automatically populates created_by and updated_by fields
+ *
+ * SQL Explanation:
+ *   - BEFORE trigger executes before the database operation
+ *   - Applies to both INSERT and UPDATE operations
+ *   - Calls set_user_timestamps() function for each row
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'user_tracking_trigger') THEN
+        CREATE TRIGGER user_tracking_trigger
+        BEFORE INSERT OR UPDATE ON users
+        FOR EACH ROW EXECUTE FUNCTION set_user_timestamps();
+    END IF;
+END $$;
+
+/* Sample data for this table has been moved to 02a-insert-users-data.sql */
+
+
+-- File: 02a-insert-users-data.sql
+-- 02a-insert-users-data.sql
+
+/*
+ * Sample User Data Insertion
+ *
+ * Description:
+ *   Initial seed data for testing and development
+ *
+ * SQL Explanation:
+ *   - INSERT statements add initial records to the users table
+ *   - Uses bcrypt hashed passwords for security
+ *   - Creates both client and admin users for testing different permissions
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM users WHERE email = 'john.doe@example.com') THEN
+        INSERT INTO users (first_name, last_name, password, email, role, photo)
+        VALUES ('John', 'Doe', '$2a$10$yJQbUq1jErn60OJ75fxRbuxtw5DjWGz9fRNmH54/mjd3s4kCzJ2be', 'john.doe@example.com', 'client', 'https://storage.googleapis.com/iotunnel-storage/default.jpg');
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM users WHERE email = 'jane.doe@example.com') THEN
+        INSERT INTO users (first_name, last_name, password, email, role, photo)
+        VALUES ('Jane', 'Doe', '$2a$10$yJQbUq1jErn60OJ75fxRbuxtw5DjWGz9fRNmH54/mjd3s4kCzJ2be', 'jane.doe@example.com', 'admin', 'https://storage.googleapis.com/iotunnel-storage/default.jpg');
+    END IF;
+END $$;
+
+-- File: 03-create-sessions-table.sql
+-- 03-create-sessions-table.sql
+
+/*
+ * Sessions Table and Associated Objects
+ *
+ * This script creates the `sessions` table, along with associated indexes and triggers.
+ * This table is used to store refresh sessions for user authentication.
+ */
+
+/*
+ * Table: sessions
+ *
+ * Description:
+ *   Stores refresh sessions used for user authentication. Includes an
+ *   `expires_at` column for session expiration.
+ *
+ * SQL Explanation:
+ *   - Creates a table with UUID PRIMARY KEY generated by gen_random_uuid()
+ *   - Establishes foreign key relationship to users table
+ *   - Sets default values for timestamps
+ *   - Implements referential integrity with ON DELETE CASCADE
+ *
+ * Columns:
+ *   - id (UUID PRIMARY KEY DEFAULT gen_random_uuid()): Unique identifier for
+ *     each session.
+ *   - user_id (UUID NOT NULL): Foreign key referencing the `users` table.
+ *     Links the session to the user it belongs to.
+ *   - token (TEXT NOT NULL): The refresh session string. Must be unique.
+ *   - user_agent (TEXT): Information about the client's browser, operating system
+ *     and device that created the session. Useful for security auditing and
+ *     analytics purposes.
+ *   - expires_at (TIMESTAMP WITH TIME ZONE NOT NULL): Timestamp indicating
+ *     when the session expires.
+ *   - created_at (TIMESTAMP WITH TIME ZONE DEFAULT NOW()): Timestamp of when
+ *     the session record was created.
+ *   - updated_at (TIMESTAMP WITH TIME ZONE): Timestamp of the last update to
+ *     the session record. Automatically updated by the
+ *     `update_sessions_updated_at` trigger.
+ *   - FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE: Ensures
+ *     referential integrity. If a user is deleted, their associated sessions
+ *     are also deleted.
+ */
+CREATE TABLE IF NOT EXISTS sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    token TEXT NOT NULL,
+    user_agent TEXT,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+/*
+ * Indexes on the sessions table
+ *
+ * Description:
+ *   These indexes improve query performance on frequently accessed columns.
+ *   Uses B-tree indexes for all columns as it's the most compatible option
+ *
+ * SQL Explanation:
+ *   - B-tree indexes support range queries, sorting, and equality comparisons
+ *   - Each CREATE INDEX statement builds a separate database structure that speeds up lookups
+ *   - Indexes require additional storage but significantly improve query speed
+ *
+ * Indexes:
+ *   - idx_sessions_token (UNIQUE): Ensures each session token is unique.
+ *   - idx_sessions_user: Allows fast lookup of sessions by user.
+ *   - idx_sessions_created_at: Useful for auditing and cleanup tasks.
+ *   - idx_sessions_expires_at: Optimizes queries for expired sessions.
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_sessions_token') THEN
+        CREATE UNIQUE INDEX idx_sessions_token ON sessions (token);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_sessions_user') THEN
+        CREATE INDEX idx_sessions_user ON sessions (user_id);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_sessions_created_at') THEN
+        CREATE INDEX idx_sessions_created_at ON sessions (created_at);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_sessions_expires_at') THEN
+        CREATE INDEX idx_sessions_expires_at ON sessions (expires_at);
+    END IF;
+END $$;
+
+/*
+ * Trigger: update_sessions_updated_at_update
+ *
+ * Description:
+ *   Automatically updates the `updated_at` column to the current timestamp
+ *   whenever a row in the `sessions` table is updated.
+ *
+ * SQL Explanation:
+ *   - BEFORE UPDATE trigger executes prior to the actual update operation
+ *   - FOR EACH ROW means it runs once for every row affected by the UPDATE
+ *   - Calls update_column_updated_at() function to set the current timestamp
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_sessions_updated_at_update') THEN
+        CREATE TRIGGER update_sessions_updated_at_update
+        BEFORE UPDATE ON sessions
+        FOR EACH ROW
+        EXECUTE FUNCTION update_column_updated_at();
+    END IF;
+END $$;
+
+/*
+ * Trigger: update_sessions_updated_at_insert
+ *
+ * Description:
+ *   Automatically updates the `updated_at` column to the current timestamp
+ *   whenever a row is inserted into the `sessions` table.
+ *
+ * SQL Explanation:
+ *   - BEFORE INSERT trigger executes prior to the actual insert operation
+ *   - FOR EACH ROW means it runs once for every row affected by the INSERT
+ *   - Calls update_column_updated_at() function to set the current timestamp
+ */
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_sessions_updated_at_insert') THEN
+        CREATE TRIGGER update_sessions_updated_at_insert
+        BEFORE INSERT ON sessions
+        FOR EACH ROW
+        EXECUTE FUNCTION update_column_updated_at();
+    END IF;
+END $$;
+
+/*
+ * Example Scheduled Job (using pg_cron)
+ *
+ * Description:
+ *   These are *examples* of how to schedule a job to periodically clean up
+ *   expired sessions.
+ *
+ * SQL Explanation:
+ *   - Uses pg_cron extension to schedule database maintenance tasks
+ *   - Schedule parameter follows cron syntax (minute, hour, day, month, weekday)
+ *   - Executes SQL statements to clean expired records at specified intervals
+ *   - Commented out as these are examples that need to be configured per deployment
+ *   - Uses CREATE OR REPLACE to avoid duplication when re-running scripts
+ */
+
+-- Example: Delete expired sessions
+-- SELECT cron.unschedule('cleanup-expired-sessions');
+-- SELECT cron.schedule('cleanup-expired-sessions', '0 3 * * *', $$
+--     DELETE FROM sessions WHERE expires_at < NOW();
+-- $$);
+
+-- Example: Soft-revoke expired sessions (recommended)
+-- SELECT cron.unschedule('revoke-expired-sessions');
+-- SELECT cron.schedule('revoke-expired-sessions', '0 3 * * *', $$
+--    UPDATE sessions SET revoked = TRUE WHERE expires_at < NOW() AND revoked = FALSE;
+-- $$);
+
+
